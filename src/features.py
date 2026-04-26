@@ -104,16 +104,9 @@ def extract_features(audio: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
     delta_padded = pad_rows(delta_mfcc)
 
     # ── Normalise each channel to zero mean / unit variance ─────────────
-    def standardise(arr: np.ndarray) -> np.ndarray:
-        mu  = arr.mean()
-        std = arr.std()
-        if std < 1e-8:
-            return arr - mu
-        return ((arr - mu) / std).astype(np.float32)
-
-    ch0 = standardise(log_mel)
-    ch1 = standardise(mfcc_padded)
-    ch2 = standardise(delta_padded)
+    ch0 = log_mel.astype(np.float32)
+    ch1 = mfcc_padded.astype(np.float32)
+    ch2 = delta_padded.astype(np.float32)
 
     # ── Pad / truncate time axis to MAX_FRAMES ───────────────────────────
     def fix_time(arr: np.ndarray, max_t: int = MAX_FRAMES) -> np.ndarray:
@@ -246,6 +239,12 @@ def build_features(input_dir: Path,
 
     for i, row in tqdm(metadata.iterrows(), total=len(metadata),
                        desc="Extracting features", unit="cycle"):
+
+        # Filter: only keep COPD and Healthy cycles
+        if row["diagnosis"] not in ["COPD", "Healthy"]:
+            valid_mask.append(False)
+            continue
+
         wav_path = input_dir / row["filename"]
         if not wav_path.exists():
             log.warning(f"  Missing file: {wav_path.name} — skipping")
@@ -256,19 +255,22 @@ def build_features(input_dir: Path,
             audio, _ = librosa.load(str(wav_path), sr=sr, mono=True)
             feat     = extract_features(audio, sr=sr)
             all_features.append(feat)
-            all_labels.append(int(row["label"]))
+            # Use actual diagnosis as binary label
+            label = 1 if row["diagnosis"] == "COPD" else 0
+            all_labels.append(label)
             valid_mask.append(True)
         except Exception as e:
             log.warning(f"  Feature extraction failed for {wav_path.name}: {e}")
             valid_mask.append(False)
 
     metadata = metadata[valid_mask].reset_index(drop=True)
+    
     X = np.stack(all_features, axis=0)          # (N, 3, 128, 128)
     y = np.array(all_labels,   dtype=np.int64)  # (N,)
 
     log.info(f"Feature array shape : {X.shape}")
     log.info(f"Label array shape   : {y.shape}")
-    log.info(f"Label distribution  : { {i: int((y==i).sum()) for i in range(4)} }")
+    log.info(f"Label distribution  : { {int(k): int(v) for k,v in zip(*np.unique(y, return_counts=True))} }")
 
     # ── Patient-level split ──────────────────────────────────────────────
     log.info("Splitting into train / val / test at patient level...")
