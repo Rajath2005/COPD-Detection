@@ -1,5 +1,8 @@
-# Dataset and generated data
-data/
+# Dataset and generated data (allow small artifacts under data/features/)
+data/raw/
+data/processed/
+data/features/*.npy
+data/features/*.zip
 
 # Trained models
 models/

@@ -1,0 +1,65 @@
+{
+  "pipeline": {
+    "data_dir": "D:\\DevWorkspace\\Github_Repos\\COPD\\ICBHI",
+    "output_dir": "D:\\DevWorkspace\\Github_Repos\\COPD\\COPD-Detection\\data\\features",
+    "seed": 42,
+    "n_jobs": 2,
+    "copd_aug_factor": 4,
+    "no_augment": true,
+    "no_denoise": false,
+    "severity_mild_max": 0.25,
+    "severity_moderate_max": 0.6,
+    "limit_files": 12,
+    "stationary_prop_decrease": 0.9,
+    "nonstationary_prop_decrease": 0.85
+  },
+  "paths": {
+    "data_dir": "D:\\DevWorkspace\\Github_Repos\\COPD\\ICBHI",
+    "output_dir": "D:\\DevWorkspace\\Github_Repos\\COPD\\COPD-Detection\\data\\features",
+    "diagnosis_csv": "D:\\DevWorkspace\\Github_Repos\\COPD\\ICBHI\\Respiratory_Sound_Database\\Respiratory_Sound_Database\\patient_diagnosis.csv"
+  },
+  "counts": {
+    "n_wavs": 12,
+    "n_windows_base": 114,
+    "n_windows_total": 114,
+    "n_patients": 6
+  },
+  "split_patients": {
+    "train": [
+      "103",
+      "104",
+      "106"
+    ],
+    "val": [
+      "105"
+    ],
+    "test": [
+      "101",
+      "102"
+    ]
+  },
+  "tensor_shapes": {
+    "X_mel": [
+      1,
+      128,
+      431
+    ],
+    "X_mfcc": [
+      3,
+      40,
+      431
+    ]
+  },
+  "versions": {
+    "numpy": "2.4.4",
+    "pandas": "3.0.2",
+    "librosa": "0.11.0",
+    "sklearn": "1.8.0",
+    "scipy": "1.17.1",
+    "noisereduce": "unknown",
+    "audiomentations": "0.43.1",
+    "soundfile": "0.13.1",
+    "joblib": "1.5.3"
+  },
+  "git_commit": "ea359a8192e5b2de21591a0c0784c5e375e70dff"
+}

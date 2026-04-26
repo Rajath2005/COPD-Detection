@@ -1,170 +1,191 @@
 """
-preprocess.py — ICBHI 2017 Respiratory Sound Database Preprocessing Pipeline
-=============================================================================
-Steps performed:
-  1. Read all WAV files + annotation (.txt) files from data/raw/
-  2. Parse annotation timestamps → individual breathing cycle segments
-  3. Resample each cycle to 22,050 Hz
-  4. Apply bandpass filter (100–8,000 Hz)
-  5. Apply spectral subtraction noise reduction
-  6. Normalise peak amplitude to [-1.0, 1.0]
-  7. Discard cycles shorter than min_duration seconds
-  8. Save each cycle as a WAV file in data/processed/
-  9. Save a metadata CSV mapping cycle files → labels + patient info
+ICBHI 2017 — unified preprocessing pipeline (Objective 1)
+==========================================================
+End-to-end: discovery → denoise → 5 s windows → Log-Mel + MFCCΔΔ²
+→ COPD-only train augmentation → patient-level stratified split → .npy + metadata + config.
 
-Usage (PowerShell):
-    python src/preprocess.py
-    python src/preprocess.py --raw-dir data/raw --out-dir data/processed --min-duration 0.5
-
-Author: VCET COPD-Detection Team
+CLI:
+    python src/preprocess.py --data_dir data/raw --output_dir data/features
 """
 
-import os
-import argparse
-import logging
-import warnings
-from pathlib import Path
+from __future__ import annotations
 
+import argparse
+import json
+import logging
+import random
+import subprocess
+import sys
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import librosa
 import numpy as np
 import pandas as pd
-import librosa
-import soundfile as sf
-from scipy.signal import butter, sosfilt
+from joblib import Parallel, delayed
+from scipy import signal
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
-# ──────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────
-TARGET_SR = 22_050          # target sample rate (Hz)
-LOWCUT    = 100             # bandpass low cutoff (Hz)
-HIGHCUT   = 8_000           # bandpass high cutoff (Hz)
-FILTER_ORDER = 4            # Butterworth filter order
+try:
+    import noisereduce as nr
+except ImportError as e:  # pragma: no cover
+    raise ImportError("Install noisereduce: pip install noisereduce") from e
 
-# ICBHI chest location codes → human-readable
-LOCATION_MAP = {
-    "Al": "Anterior Left",
-    "Ar": "Anterior Right",
-    "Pl": "Posterior Left",
-    "Pr": "Posterior Right",
-    "Ll": "Lateral Left",
-    "Lr": "Lateral Right",
-    "Tc": "Trachea",
-}
+try:
+    from audiomentations import (
+        AddGaussianNoise,
+        Compose,
+        PitchShift,
+        Shift,
+        TimeStretch,
+    )
+except ImportError as e:  # pragma: no cover
+    raise ImportError("Install audiomentations: pip install audiomentations") from e
 
-# ──────────────────────────────────────────────
-# Logging setup
-# ──────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════
-# Audio processing utilities
-# ══════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+TARGET_SR = 22_050
+WIN_SEC = 5.0
+WIN_SAMPLES = int(WIN_SEC * TARGET_SR)  # 110_250
+HOP_SEC_FALLBACK = 2.5
+N_FFT = 2048
+HOP_LENGTH = 256
+N_MELS = 128
+N_MFCC = 40
+N_FRAMES = 431
+BANDPASS_LOW = 80.0
+BANDPASS_HIGH = 2000.0
+BANDPASS_ORDER = 4
+MEL_FMIN = 50.0
+MEL_FMAX = 2000.0
 
-def bandpass_filter(signal: np.ndarray, sr: int,
-                    lowcut: float = LOWCUT,
-                    highcut: float = HIGHCUT,
-                    order: int = FILTER_ORDER) -> np.ndarray:
+
+@dataclass
+class PipelineConfig:
+    data_dir: Path
+    output_dir: Path
+    seed: int = 42
+    n_jobs: int = -1
+    copd_aug_factor: int = 4
+    no_augment: bool = False
+    no_denoise: bool = False
+    severity_mild_max: float = 0.25
+    severity_moderate_max: float = 0.60
+    limit_files: Optional[int] = None
+    stationary_prop_decrease: float = 0.9
+    nonstationary_prop_decrease: float = 0.85
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SpecAugment (callable from training code)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def spec_augment(
+    mel: np.ndarray,
+    rng: Optional[np.random.Generator] = None,
+    time_masks: int = 2,
+    time_mask_param: int = 30,
+    freq_masks: int = 2,
+    freq_mask_param: int = 15,
+) -> np.ndarray:
     """
-    Apply a Butterworth bandpass filter to a 1-D audio signal.
-    Uses second-order sections (sosfilt) for numerical stability.
+    Time + frequency masking on a log-mel-like spectrogram.
+
+    Parameters
+    ----------
+    mel : array, shape (1, n_mels, n_frames) or (n_mels, n_frames)
+    rng : np.random.Generator, optional
+
+    Returns
+    -------
+    augmented copy, float32, same shape as input (channel preserved if present).
     """
-    nyq = sr / 2.0
-    low  = lowcut  / nyq
-    high = highcut / nyq
-    # Clamp to valid range to avoid edge-case errors
-    low  = max(low,  1e-4)
-    high = min(high, 1.0 - 1e-4)
-    sos = butter(order, [low, high], btype="bandpass", output="sos")
-    return sosfilt(sos, signal).astype(np.float32)
+    rng = rng or np.random.default_rng()
+    x = np.array(mel, dtype=np.float32, copy=True)
+    if x.ndim == 3:
+        m = x[0]
+        squeeze = True
+    else:
+        m = x
+        squeeze = False
+    n_mels, n_frames = m.shape
+    out = m.copy()
+    for _ in range(max(0, time_masks)):
+        w = int(rng.integers(1, min(time_mask_param, max(2, n_frames))))
+        t0 = int(rng.integers(0, max(1, n_frames - w)))
+        out[:, t0 : t0 + w] = 0.0
+    for _ in range(max(0, freq_masks)):
+        f = int(rng.integers(1, min(freq_mask_param, max(2, n_mels))))
+        f0 = int(rng.integers(0, max(1, n_mels - f)))
+        out[f0 : f0 + f, :] = 0.0
+    if squeeze:
+        return np.expand_dims(out, axis=0).astype(np.float32)
+    return out.astype(np.float32)
 
 
-def spectral_subtraction(signal: np.ndarray, sr: int,
-                         noise_duration: float = 0.1) -> np.ndarray:
-    """
-    Simple spectral subtraction noise reduction.
-    Estimates noise PSD from the first `noise_duration` seconds,
-    then subtracts it from the full signal spectrum.
-    """
-    n_fft    = 1024
-    hop_len  = 256
-    noise_samples = int(noise_duration * sr)
-
-    # Estimate noise from the first segment
-    noise_segment = signal[:noise_samples] if len(signal) > noise_samples else signal
-    noise_stft    = librosa.stft(noise_segment, n_fft=n_fft, hop_length=hop_len)
-    noise_power   = np.mean(np.abs(noise_stft) ** 2, axis=1, keepdims=True)
-
-    # Full signal STFT
-    signal_stft  = librosa.stft(signal, n_fft=n_fft, hop_length=hop_len)
-    signal_power = np.abs(signal_stft) ** 2
-    phase        = np.angle(signal_stft)
-
-    # Subtract noise power (floor at 0)
-    clean_power  = np.maximum(signal_power - noise_power, 0.0)
-    clean_mag    = np.sqrt(clean_power)
-    clean_stft   = clean_mag * np.exp(1j * phase)
-
-    reconstructed = librosa.istft(clean_stft, hop_length=hop_len,
-                                  length=len(signal))
-    return reconstructed.astype(np.float32)
+# ═══════════════════════════════════════════════════════════════════════════
+# Dataset discovery
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def normalise_amplitude(signal: np.ndarray) -> np.ndarray:
-    """
-    Peak-normalise signal to the range [-1.0, 1.0].
-    Returns the original signal unchanged if it is silent.
-    """
-    peak = np.max(np.abs(signal))
-    if peak < 1e-8:
-        return signal
-    return (signal / peak).astype(np.float32)
+def find_patient_diagnosis_csv(root: Path) -> Path:
+    hits = sorted(root.rglob("patient_diagnosis.csv"))
+    if not hits:
+        raise FileNotFoundError(
+            f"patient_diagnosis.csv not found under {root}. "
+            "Point --data_dir at the ICBHI root or a parent folder."
+        )
+    return hits[0]
 
 
-def load_and_preprocess(wav_path: Path, sr: int = TARGET_SR,
-                        denoise: bool = True) -> np.ndarray:
-    """
-    Load a WAV file, resample to `sr`, apply bandpass filter,
-    optional spectral subtraction, and peak normalisation.
-    Returns a float32 mono array.
-    """
-    audio, orig_sr = librosa.load(str(wav_path), sr=None, mono=True)
-
-    # Resample if needed
-    if orig_sr != sr:
-        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=sr)
-
-    audio = bandpass_filter(audio, sr)
-
-    if denoise:
-        audio = spectral_subtraction(audio, sr)
-
-    audio = normalise_amplitude(audio)
-    return audio
+def discover_wavs(root: Path, limit: Optional[int] = None) -> List[Path]:
+    wavs = sorted({p.resolve() for p in root.rglob("*.wav") if p.is_file()})
+    if limit is not None:
+        wavs = wavs[: int(limit)]
+    if not wavs:
+        raise FileNotFoundError(f"No .wav files found under {root}")
+    return wavs
 
 
-# ══════════════════════════════════════════════
-# Annotation parsing
-# ══════════════════════════════════════════════
+def load_diagnoses(csv_path: Path) -> Dict[str, str]:
+    df = pd.read_csv(csv_path, header=None, names=["patient_id", "diagnosis"])
+    df["patient_id"] = df["patient_id"].astype(str).str.strip()
+    df["diagnosis"] = df["diagnosis"].astype(str).str.strip()
+    return dict(zip(df["patient_id"], df["diagnosis"]))
 
-def parse_annotation(txt_path: Path) -> list[dict]:
-    """
-    Parse an ICBHI annotation file.
 
-    File format (tab-separated, no header):
-        <start_sec>  <end_sec>  <crackle>  <wheeze>
+def parse_filename_meta(wav_name: str) -> Dict[str, str]:
+    stem = Path(wav_name).stem
+    parts = stem.split("_")
+    return {
+        "patient_id": parts[0] if parts else "unknown",
+        "rec_index": parts[1] if len(parts) > 1 else "",
+        "chest_loc": parts[2] if len(parts) > 2 else "",
+        "acq_mode": parts[3] if len(parts) > 3 else "",
+        "device": parts[4] if len(parts) > 4 else "",
+    }
 
-    Returns a list of dicts, one per breathing cycle.
-    """
-    cycles = []
-    with open(txt_path, "r") as f:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Annotations & patient-level adventitious ratio
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def parse_annotation(txt_path: Path) -> List[Dict[str, Any]]:
+    cycles: List[Dict[str, Any]] = []
+    if not txt_path.exists():
+        return cycles
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -173,268 +194,630 @@ def parse_annotation(txt_path: Path) -> list[dict]:
             if len(parts) < 4:
                 continue
             try:
-                cycles.append({
-                    "start":   float(parts[0]),
-                    "end":     float(parts[1]),
-                    "crackle": int(parts[2]),
-                    "wheeze":  int(parts[3]),
-                })
+                cycles.append(
+                    {
+                        "start": float(parts[0]),
+                        "end": float(parts[1]),
+                        "crackle": int(float(parts[2])),
+                        "wheeze": int(float(parts[3])),
+                    }
+                )
             except ValueError:
                 continue
     return cycles
 
 
-def parse_filename(wav_name: str) -> dict:
-    """
-    Extract metadata encoded in the ICBHI filename convention:
-        {patient_id}_{rec_index}_{chest_loc}_{acq_mode}_{device}.wav
-
-    Example: 101_1b1_Al_sc_Meditron.wav
-    """
-    stem  = Path(wav_name).stem
-    parts = stem.split("_")
-    result = {
-        "patient_id":  parts[0] if len(parts) > 0 else "unknown",
-        "rec_index":   parts[1] if len(parts) > 1 else "unknown",
-        "chest_loc":   LOCATION_MAP.get(parts[2], parts[2]) if len(parts) > 2 else "unknown",
-        "acq_mode":    parts[3] if len(parts) > 3 else "unknown",
-        "device":      parts[4] if len(parts) > 4 else "unknown",
-    }
-    return result
-
-
-def assign_label(crackle: int, wheeze: int) -> int:
-    """
-    Map (crackle, wheeze) flags to a 4-class label.
-
-        0 → Normal        (no crackle, no wheeze)
-        1 → Crackle only
-        2 → Wheeze only
-        3 → Both
-
-    This is the standard ICBHI 4-class scheme used as a
-    proxy for COPD severity in the absence of GOLD staging.
-    """
-    if crackle == 0 and wheeze == 0:
-        return 0
-    elif crackle == 1 and wheeze == 0:
-        return 1
-    elif crackle == 0 and wheeze == 1:
-        return 2
-    else:
-        return 3
+def collect_patient_cycle_stats(
+    wav_paths: Sequence[Path],
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Return (adventitious_cycle_count, total_cycle_count) per patient_id."""
+    adv: Dict[str, int] = {}
+    tot: Dict[str, int] = {}
+    for wav in wav_paths:
+        meta = parse_filename_meta(wav.name)
+        pid = meta["patient_id"]
+        txt = wav.with_suffix(".txt")
+        cycles = parse_annotation(txt)
+        tot.setdefault(pid, 0)
+        adv.setdefault(pid, 0)
+        for c in cycles:
+            tot[pid] += 1
+            if c["crackle"] == 1 or c["wheeze"] == 1:
+                adv[pid] += 1
+    return adv, tot
 
 
-LABEL_NAMES = {0: "Normal", 1: "Crackle", 2: "Wheeze", 3: "Both"}
+def severity_for_copd_patient(
+    ratio: float,
+    mild_max: float,
+    moderate_max: float,
+) -> int:
+    if ratio < mild_max:
+        return 1  # Mild
+    if ratio <= moderate_max:
+        return 2  # Moderate
+    return 3  # Severe
 
 
-# ══════════════════════════════════════════════
-# Patient diagnosis loading
-# ══════════════════════════════════════════════
-
-def load_patient_diagnoses(raw_dir: Path) -> dict:
-    """
-    Load patient_diagnosis.csv (or .txt) from raw_dir.
-    Returns a dict mapping patient_id (str) → diagnosis (str).
-    Falls back gracefully if the file is missing.
-    """
-    for name in ["patient_diagnosis.csv", "patient_diagnosis.txt"]:
-        p = raw_dir / name
-        if p.exists():
-            try:
-                df = pd.read_csv(p, header=None, names=["patient_id", "diagnosis"])
-                df["patient_id"] = df["patient_id"].astype(str).str.strip()
-                df["diagnosis"]  = df["diagnosis"].astype(str).str.strip()
-                log.info(f"Loaded patient diagnoses from {p.name}  ({len(df)} patients)")
-                return dict(zip(df["patient_id"], df["diagnosis"]))
-            except Exception as e:
-                log.warning(f"Could not parse {p.name}: {e}")
-    log.warning("patient_diagnosis file not found — diagnosis column will be 'unknown'")
-    return {}
-
-
-# ══════════════════════════════════════════════
-# Main pipeline
-# ══════════════════════════════════════════════
-
-def process_dataset(raw_dir: Path,
-                    out_dir: Path,
-                    min_duration: float = 0.5,
-                    sr: int = TARGET_SR,
-                    denoise: bool = True) -> pd.DataFrame:
-    """
-    Run the full preprocessing pipeline over all WAV files in raw_dir.
-
-    Parameters
-    ----------
-    raw_dir      : path containing .wav + .txt annotation files
-    out_dir      : where to save cycle WAV files
-    min_duration : minimum cycle length in seconds (shorter cycles are dropped)
-    sr           : target sample rate
-    denoise      : whether to apply spectral subtraction
-
-    Returns
-    -------
-    metadata DataFrame saved to out_dir/metadata.csv
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    diagnoses = load_patient_diagnoses(raw_dir)
-
-    # Collect all WAV files
-    wav_files = sorted(raw_dir.glob("*.wav"))
-    if not wav_files:
-        log.error(f"No WAV files found in {raw_dir}")
-        log.error("Make sure you extracted ICBHI_final_database.zip into data/raw/")
-        raise FileNotFoundError(f"No WAV files in {raw_dir}")
-
-    log.info(f"Found {len(wav_files)} WAV files in {raw_dir}")
-
-    records     = []
-    total_saved = 0
-    total_skip  = 0
-
-    for wav_path in tqdm(wav_files, desc="Processing recordings", unit="file"):
-        txt_path = wav_path.with_suffix(".txt")
-        if not txt_path.exists():
-            log.warning(f"  No annotation file for {wav_path.name} — skipping")
+def build_patient_severity_map(
+    diagnoses: Dict[str, str],
+    adv: Dict[str, int],
+    tot: Dict[str, int],
+    mild_max: float,
+    moderate_max: float,
+) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    all_pids = set(diagnoses.keys()) | set(tot.keys()) | set(adv.keys())
+    for pid in all_pids:
+        diag = diagnoses.get(pid, "")
+        d = str(diag).strip().upper()
+        if d != "COPD":
+            out[pid] = 0
             continue
-
-        # Parse filename metadata
-        meta = parse_filename(wav_path.name)
-        pid  = meta["patient_id"]
-        diag = diagnoses.get(pid, "unknown")
-
-        # Load and preprocess the full recording
-        try:
-            full_audio = load_and_preprocess(wav_path, sr=sr, denoise=denoise)
-        except Exception as e:
-            log.warning(f"  Failed to load {wav_path.name}: {e}")
+        t = tot.get(pid, 0)
+        if t <= 0:
+            out[pid] = 1
             continue
-
-        # Parse annotation → extract individual cycles
-        cycles = parse_annotation(txt_path)
-        if not cycles:
-            log.warning(f"  No valid cycles in {txt_path.name}")
-            continue
-
-        for idx, cycle in enumerate(cycles):
-            start_sec = cycle["start"]
-            end_sec   = cycle["end"]
-            duration  = end_sec - start_sec
-
-            # Drop cycles that are too short
-            if duration < min_duration:
-                total_skip += 1
-                continue
-
-            # Convert time → samples
-            start_sample = int(start_sec * sr)
-            end_sample   = int(end_sec   * sr)
-
-            # Guard against annotation overshoot
-            end_sample = min(end_sample, len(full_audio))
-            if start_sample >= end_sample:
-                total_skip += 1
-                continue
-
-            cycle_audio = full_audio[start_sample:end_sample]
-
-            # Build output filename
-            stem     = wav_path.stem
-            out_name = f"{stem}_cycle_{idx:03d}.wav"
-            out_path = out_dir / out_name
-
-            # Save cycle WAV
-            sf.write(str(out_path), cycle_audio, sr, subtype="PCM_16")
-
-            label = assign_label(cycle["crackle"], cycle["wheeze"])
-
-            records.append({
-                "filename":    out_name,
-                "patient_id":  pid,
-                "diagnosis":   diag,
-                "chest_loc":   meta["chest_loc"],
-                "device":      meta["device"],
-                "acq_mode":    meta["acq_mode"],
-                "start_sec":   round(start_sec, 4),
-                "end_sec":     round(end_sec,   4),
-                "duration":    round(duration,  4),
-                "crackle":     cycle["crackle"],
-                "wheeze":      cycle["wheeze"],
-                "label":       label,
-                "label_name":  LABEL_NAMES[label],
-            })
-            total_saved += 1
-
-    if not records:
-        log.error("No cycles were saved. Check your raw_dir path and annotation files.")
-        raise RuntimeError("Preprocessing produced no output.")
-
-    metadata = pd.DataFrame(records)
-    csv_path = out_dir / "metadata.csv"
-    metadata.to_csv(csv_path, index=False)
-
-    # ── Summary ─────────────────────────────────────────────────────────
-    log.info("=" * 55)
-    log.info(f"  Cycles saved   : {total_saved}")
-    log.info(f"  Cycles skipped : {total_skip}  (too short < {min_duration}s)")
-    log.info(f"  Output dir     : {out_dir}")
-    log.info(f"  Metadata CSV   : {csv_path}")
-    log.info("")
-    log.info("  Label distribution:")
-    for label_id, name in LABEL_NAMES.items():
-        count = (metadata["label"] == label_id).sum()
-        pct   = count / len(metadata) * 100
-        log.info(f"    {label_id} — {name:<10}: {count:>5} cycles  ({pct:.1f}%)")
-    log.info("=" * 55)
-
-    return metadata
+        r = adv.get(pid, 0) / float(t)
+        out[pid] = severity_for_copd_patient(r, mild_max, moderate_max)
+    return out
 
 
-# ══════════════════════════════════════════════
-# Entry point
-# ══════════════════════════════════════════════
+def binary_label(diagnosis: str) -> int:
+    return 1 if str(diagnosis).strip().upper() == "COPD" else 0
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Preprocess ICBHI 2017 respiratory sound dataset"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Audio: denoise, segment
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def butter_bandpass_sos(y: np.ndarray, sr: int, low: float, high: float, order: int = 4):
+    nyq = sr / 2.0
+    lo = max(low / nyq, 1e-5)
+    hi = min(high / nyq, 1.0 - 1e-5)
+    if lo >= hi:
+        raise ValueError(f"Invalid bandpass [{low},{high}] for sr={sr}")
+    return signal.butter(order, [lo, hi], btype="band", output="sos")
+
+
+def denoise_multistage(
+    y: np.ndarray,
+    sr: int,
+    cfg: PipelineConfig,
+) -> np.ndarray:
+    if cfg.no_denoise:
+        return y.astype(np.float32)
+    y1 = nr.reduce_noise(
+        y=y, sr=sr, stationary=True, prop_decrease=cfg.stationary_prop_decrease
     )
-    parser.add_argument("--raw-dir",      type=Path, default=Path("data/raw"),
-                        help="Directory containing raw ICBHI WAV + TXT files")
-    parser.add_argument("--out-dir",      type=Path, default=Path("data/processed"),
-                        help="Output directory for cycle WAV files and metadata.csv")
-    parser.add_argument("--sample-rate",  type=int,  default=TARGET_SR,
-                        help="Target sample rate in Hz (default: 22050)")
-    parser.add_argument("--min-duration", type=float, default=0.5,
-                        help="Minimum cycle duration in seconds (default: 0.5)")
-    parser.add_argument("--no-denoise",   action="store_true",
-                        help="Skip spectral subtraction noise reduction")
-    return parser.parse_args()
+    y2 = nr.reduce_noise(
+        y=y1,
+        sr=sr,
+        stationary=False,
+        prop_decrease=cfg.nonstationary_prop_decrease,
+    )
+    sos = butter_bandpass_sos(y2, sr, BANDPASS_LOW, BANDPASS_HIGH, BANDPASS_ORDER)
+    y3 = signal.sosfiltfilt(sos, y2).astype(np.float32)
+    peak = float(np.max(np.abs(y3))) + 1e-12
+    return (y3 / peak).astype(np.float32)
+
+
+def _extract_window_centered(
+    y: np.ndarray, sr: int, center_sec: float, win_samples: int
+) -> Tuple[np.ndarray, float]:
+    """Return audio of length win_samples (reflect-pad if needed) and window start time in seconds."""
+    center = int(round(center_sec * sr))
+    half = win_samples // 2
+    start = center - half
+    end = start + win_samples
+    if start >= 0 and end <= len(y):
+        seg = y[start:end].astype(np.float32)
+        t0 = start / float(sr)
+        return seg, t0
+    seg = np.zeros(win_samples, dtype=np.float32)
+    for i in range(win_samples):
+        idx = start + i
+        if 0 <= idx < len(y):
+            seg[i] = y[idx]
+        else:
+            # reflect at boundaries
+            j = idx
+            if j < 0:
+                j = -j
+            if j >= len(y):
+                j = 2 * (len(y) - 1) - j
+            j = int(np.clip(j, 0, len(y) - 1))
+            seg[i] = y[j]
+    t0 = start / float(sr)
+    return seg.astype(np.float32), t0
+
+
+def segment_audio(
+    y: np.ndarray,
+    sr: int,
+    cycles: List[Dict[str, Any]],
+    win_samples: int = WIN_SAMPLES,
+    hop_sec: float = HOP_SEC_FALLBACK,
+) -> List[Dict[str, Any]]:
+    """Produce fixed-length windows with cycle-aligned centers or sliding fallback."""
+    out: List[Dict[str, Any]] = []
+    if cycles:
+        for ci, c in enumerate(cycles):
+            dur = c["end"] - c["start"]
+            if dur <= 0:
+                continue
+            center_sec = 0.5 * (c["start"] + c["end"])
+            seg, t0 = _extract_window_centered(y, sr, center_sec, win_samples)
+            out.append(
+                {
+                    "y": seg,
+                    "window_start_sec": float(t0),
+                    "crackle": int(c["crackle"]),
+                    "wheeze": int(c["wheeze"]),
+                    "cycle_index": ci,
+                }
+            )
+        return out
+    # Sliding fallback
+    hop = int(hop_sec * sr)
+    if len(y) < win_samples:
+        pad = win_samples - len(y)
+        y = np.pad(y.astype(np.float32), (0, pad), mode="reflect")
+    pos = 0
+    idx = 0
+    while pos + win_samples <= len(y):
+        seg = y[pos : pos + win_samples].astype(np.float32)
+        out.append(
+            {
+                "y": seg,
+                "window_start_sec": pos / float(sr),
+                "crackle": 0,
+                "wheeze": 0,
+                "cycle_index": idx,
+            }
+        )
+        pos += hop
+        idx += 1
+    if not out and len(y) >= win_samples:
+        seg = y[:win_samples].astype(np.float32)
+        out.append(
+            {
+                "y": seg,
+                "window_start_sec": 0.0,
+                "crackle": 0,
+                "wheeze": 0,
+                "cycle_index": 0,
+            }
+        )
+    return out
+
+
+def build_augmenter(seed: int) -> Compose:
+    # audiomentations uses numpy random internally
+    np.random.seed(seed)
+    return Compose(
+        [
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+            TimeStretch(min_rate=0.9, max_rate=1.1, p=0.5),
+            PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
+            Shift(min_shift=-0.2, max_shift=0.2, p=0.5),
+        ],
+        p=1.0,
+    )
+
+
+def augment_audio(y: np.ndarray, sr: int, augmenter: Compose) -> np.ndarray:
+    return augmenter(samples=y, sample_rate=sr).astype(np.float32)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Features
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def fix_time_axis(spec: np.ndarray, n_frames: int = N_FRAMES) -> np.ndarray:
+    t = spec.shape[1]
+    if t == n_frames:
+        return spec
+    if t < n_frames:
+        pad_w = n_frames - t
+        return np.pad(spec, ((0, 0), (0, pad_w)), mode="edge")
+    return spec[:, :n_frames]
+
+
+def extract_log_mel(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
+    mel = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        n_mels=N_MELS,
+        fmin=MEL_FMIN,
+        fmax=min(MEL_FMAX, sr / 2 - 1),
+        power=2.0,
+    )
+    log_mel = librosa.power_to_db(mel, ref=np.max)
+    log_mel = fix_time_axis(log_mel, N_FRAMES)
+    lo, hi = float(log_mel.min()), float(log_mel.max())
+    if hi - lo < 1e-8:
+        norm = np.zeros_like(log_mel, dtype=np.float32)
+    else:
+        norm = ((log_mel - lo) / (hi - lo)).astype(np.float32)
+    return np.expand_dims(norm, axis=0)
+
+
+def extract_mfcc_stack(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
+    mfcc = librosa.feature.mfcc(
+        y=y,
+        sr=sr,
+        n_mfcc=N_MFCC,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        fmin=MEL_FMIN,
+        fmax=min(MEL_FMAX, sr / 2 - 1),
+    )
+    d1 = librosa.feature.delta(mfcc)
+    d2 = librosa.feature.delta(mfcc, order=2)
+    stack = np.stack([mfcc, d1, d2], axis=0).astype(np.float32)
+    stack = np.stack([fix_time_axis(stack[i], N_FRAMES) for i in range(3)], axis=0)
+    for c in range(3):
+        ch = stack[c]
+        mu, std = float(ch.mean()), float(ch.std())
+        if std < 1e-8:
+            stack[c] = (ch - mu).astype(np.float32)
+        else:
+            stack[c] = ((ch - mu) / std).astype(np.float32)
+    return stack
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Patient-level split (60/20/20)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def patient_train_val_test(
+    patient_ids: np.ndarray,
+    y_binary: np.ndarray,
+    seed: int,
+) -> Tuple[set, set, set]:
+    """StratifiedGroupKFold: first fold ~20% test; on remainder, first fold ~25% val → 20% of all."""
+    patient_ids = np.asarray(patient_ids)
+    y_binary = np.asarray(y_binary)
+    X_dummy = np.zeros(len(patient_ids))
+    class_counts = np.bincount(y_binary.astype(int), minlength=2)
+    min_class = int(class_counts.min()) if len(class_counts) else 0
+
+    if min_class >= 5 and len(patient_ids) >= 10:
+        sgkf1 = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+        trainval_idx, test_idx = next(
+            sgkf1.split(X_dummy, y_binary, groups=patient_ids)
+        )
+        p_test = set(patient_ids[test_idx].tolist())
+
+        p_tv = patient_ids[trainval_idx]
+        y_tv = y_binary[trainval_idx]
+        X_tv = np.zeros(len(p_tv))
+        tv_counts = np.bincount(y_tv.astype(int), minlength=2)
+        if int(tv_counts.min()) >= 4 and len(p_tv) >= 8:
+            sgkf2 = StratifiedGroupKFold(n_splits=4, shuffle=True, random_state=seed + 1)
+            train_rel, val_rel = next(sgkf2.split(X_tv, y_tv, groups=p_tv))
+        else:
+            gss2 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed + 1)
+            train_rel, val_rel = next(gss2.split(X_tv, y_tv, groups=p_tv))
+        p_train = set(p_tv[train_rel].tolist())
+        p_val = set(p_tv[val_rel].tolist())
+    else:
+        # Small-debug fallback (e.g., --limit): group split without stratification
+        gss1 = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+        trainval_idx, test_idx = next(gss1.split(X_dummy, y_binary, groups=patient_ids))
+        p_test = set(patient_ids[test_idx].tolist())
+        p_tv = patient_ids[trainval_idx]
+        y_tv = y_binary[trainval_idx]
+        X_tv = np.zeros(len(p_tv))
+        gss2 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed + 1)
+        train_rel, val_rel = next(gss2.split(X_tv, y_tv, groups=p_tv))
+        p_train = set(p_tv[train_rel].tolist())
+        p_val = set(p_tv[val_rel].tolist())
+
+    assert p_train.isdisjoint(p_val) and p_train.isdisjoint(p_test) and p_val.isdisjoint(p_test)
+    return p_train, p_val, p_test
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Per-file worker
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def process_one_wav(
+    wav_path: Path,
+    diagnoses: Dict[str, str],
+    severity_map: Dict[str, int],
+    cfg: PipelineConfig,
+) -> List[Dict[str, Any]]:
+    meta_file = parse_filename_meta(wav_path.name)
+    pid = meta_file["patient_id"]
+    diag = diagnoses.get(pid, "unknown")
+    bin_lab = binary_label(diag)
+    sev = int(severity_map.get(pid, 0))
+
+    try:
+        y, _ = librosa.load(str(wav_path), sr=TARGET_SR, mono=True)
+    except Exception as e:
+        log.warning("Failed to load %s: %s", wav_path.name, e)
+        return []
+
+    y = denoise_multistage(y.astype(np.float32), TARGET_SR, cfg)
+    txt_path = wav_path.with_suffix(".txt")
+    cycles = parse_annotation(txt_path)
+    windows = segment_audio(y, TARGET_SR, cycles)
+    rows: List[Dict[str, Any]] = []
+    for w in windows:
+        rows.append(
+            {
+                "y": w["y"],
+                "patient_id": pid,
+                "source_file": wav_path.name,
+                "window_start_sec": w["window_start_sec"],
+                "diagnosis": diag,
+                "binary": bin_lab,
+                "severity": sev,
+                "crackle": w["crackle"],
+                "wheeze": w["wheeze"],
+                "cycle_index": w["cycle_index"],
+            }
+        )
+    return rows
+
+
+def git_commit_hash(repo_root: Path) -> str:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def package_versions() -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    mapping = {
+        "numpy": "numpy",
+        "pandas": "pandas",
+        "librosa": "librosa",
+        "sklearn": "sklearn",
+        "scipy": "scipy",
+        "noisereduce": "noisereduce",
+        "audiomentations": "audiomentations",
+        "soundfile": "soundfile",
+        "joblib": "joblib",
+    }
+    for key, modname in mapping.items():
+        try:
+            m = __import__(modname)
+            out[key] = getattr(m, "__version__", "unknown")
+        except Exception:
+            out[key] = "not_installed"
+    return out
+
+
+def run_pipeline(cfg: PipelineConfig) -> None:
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
+
+    diag_csv = find_patient_diagnosis_csv(cfg.data_dir)
+    diagnoses = load_diagnoses(diag_csv)
+    wav_paths = discover_wavs(cfg.data_dir, cfg.limit_files)
+    log.info("Found %d wav files under %s", len(wav_paths), cfg.data_dir)
+    log.info("Diagnosis CSV: %s", diag_csv)
+
+    adv, tot = collect_patient_cycle_stats(wav_paths)
+    severity_map = build_patient_severity_map(
+        diagnoses, adv, tot, cfg.severity_mild_max, cfg.severity_moderate_max
+    )
+
+    n_jobs = cfg.n_jobs if cfg.n_jobs != 0 else 1
+    results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(process_one_wav)(wav, diagnoses, severity_map, cfg)
+        for wav in tqdm(wav_paths, desc="Processing recordings")
+    )
+    flat: List[Dict[str, Any]] = [item for sub in results for item in sub]
+    if not flat:
+        raise RuntimeError("No windows produced — check paths and annotations.")
+
+    base_df = pd.DataFrame(
+        [
+            {
+                k: v
+                for k, v in r.items()
+                if k != "y"
+            }
+            for r in flat
+        ]
+    )
+    audio_list = [r["y"] for r in flat]
+
+    # Patient-level split
+    patients = sorted(base_df["patient_id"].unique())
+    y_pat = np.array([binary_label(diagnoses.get(p, "")) for p in patients])
+    p_train, p_val, p_test = patient_train_val_test(
+        np.array(patients), y_pat, cfg.seed
+    )
+
+    def split_for_pid(pid: str) -> str:
+        if pid in p_train:
+            return "train"
+        if pid in p_val:
+            return "val"
+        if pid in p_test:
+            return "test"
+        return "unknown"
+
+    base_df["split"] = base_df["patient_id"].map(split_for_pid)
+    if (base_df["split"] == "unknown").any():
+        raise RuntimeError("Some patients not assigned to a split.")
+
+    # Expand augmentation (train + COPD only)
+    augmenter = build_augmenter(cfg.seed)
+    expanded_y: List[np.ndarray] = []
+    expanded_meta: List[Dict[str, Any]] = []
+
+    for i in range(len(base_df)):
+        row = base_df.iloc[i]
+        y = audio_list[i]
+        sp = row["split"]
+        is_copd = int(row["binary"]) == 1
+        expanded_y.append(y)
+        expanded_meta.append({**row.to_dict(), "is_augmented": False})
+        if (
+            not cfg.no_augment
+            and sp == "train"
+            and is_copd
+            and cfg.copd_aug_factor > 0
+        ):
+            for k in range(cfg.copd_aug_factor):
+                ya = augment_audio(y, TARGET_SR, augmenter)
+                expanded_y.append(ya)
+                expanded_meta.append(
+                    {**row.to_dict(), "is_augmented": True, "aug_index": k}
+                )
+
+    meta_out = pd.DataFrame(expanded_meta)
+
+    # Features
+    X_mel_list: List[np.ndarray] = []
+    X_mfcc_list: List[np.ndarray] = []
+    y_bin_list: List[int] = []
+    y_sev_list: List[int] = []
+
+    for y in tqdm(expanded_y, desc="Feature extraction"):
+        X_mel_list.append(extract_log_mel(y, TARGET_SR))
+        X_mfcc_list.append(extract_mfcc_stack(y, TARGET_SR))
+
+    for _, r in meta_out.iterrows():
+        y_bin_list.append(int(r["binary"]))
+        y_sev_list.append(int(r["severity"]))
+
+    X_mel = np.stack(X_mel_list, axis=0).astype(np.float32)
+    X_mfcc = np.stack(X_mfcc_list, axis=0).astype(np.float32)
+    y_binary = np.array(y_bin_list, dtype=np.int64)
+    y_severity = np.array(y_sev_list, dtype=np.int64)
+
+    # Split arrays by meta_out['split']
+    splits = {}
+    for name in ("train", "val", "test"):
+        mask = (meta_out["split"] == name).to_numpy()
+        splits[name] = {
+            "X_mel": X_mel[mask],
+            "X_mfcc": X_mfcc[mask],
+            "y_binary": y_binary[mask],
+            "y_severity": y_severity[mask],
+        }
+
+    # Sanity checks
+    for name in ("train", "val", "test"):
+        m = meta_out["split"] == name
+        assert splits[name]["X_mel"].shape[0] == int(m.sum())
+    for a, b in [("train", "val"), ("train", "test"), ("val", "test")]:
+        pa = set(meta_out.loc[meta_out["split"] == a, "patient_id"])
+        pb = set(meta_out.loc[meta_out["split"] == b, "patient_id"])
+        assert pa.isdisjoint(pb), f"Patient leakage between {a} and {b}"
+
+    # Save
+    for name in ("train", "val", "test"):
+        np.save(cfg.output_dir / f"X_mel_{name}.npy", splits[name]["X_mel"])
+        np.save(cfg.output_dir / f"X_mfcc_{name}.npy", splits[name]["X_mfcc"])
+        np.save(cfg.output_dir / f"y_binary_{name}.npy", splits[name]["y_binary"])
+        np.save(cfg.output_dir / f"y_severity_{name}.npy", splits[name]["y_severity"])
+
+    meta_path = cfg.output_dir / "metadata.csv"
+    meta_out.to_csv(meta_path, index=False)
+
+    repo_root = Path(__file__).resolve().parents[1]
+    pipe_d = asdict(cfg)
+    for k, v in list(pipe_d.items()):
+        if isinstance(v, Path):
+            pipe_d[k] = str(v.resolve())
+    config_dict = {
+        "pipeline": pipe_d,
+        "paths": {
+            "data_dir": str(cfg.data_dir.resolve()),
+            "output_dir": str(cfg.output_dir.resolve()),
+            "diagnosis_csv": str(diag_csv.resolve()),
+        },
+        "counts": {
+            "n_wavs": len(wav_paths),
+            "n_windows_base": len(base_df),
+            "n_windows_total": len(meta_out),
+            "n_patients": len(patients),
+        },
+        "split_patients": {
+            "train": sorted(p_train),
+            "val": sorted(p_val),
+            "test": sorted(p_test),
+        },
+        "tensor_shapes": {
+            "X_mel": [1, N_MELS, N_FRAMES],
+            "X_mfcc": [3, N_MFCC, N_FRAMES],
+        },
+        "versions": package_versions(),
+        "git_commit": git_commit_hash(repo_root),
+    }
+    with open(cfg.output_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2)
+
+    log.info("Saved features to %s", cfg.output_dir)
+    log.info("X_mel train shape: %s", splits["train"]["X_mel"].shape)
+    log.info("X_mfcc train shape: %s", splits["train"]["X_mfcc"].shape)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
+    p = argparse.ArgumentParser(description="ICBHI 2017 preprocessing → features")
+    p.add_argument("--data_dir", type=Path, default=Path("data/raw"))
+    p.add_argument("--output_dir", type=Path, default=Path("data/features"))
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--n_jobs", type=int, default=-1)
+    p.add_argument("--copd_aug_factor", type=int, default=4)
+    p.add_argument("--no_augment", action="store_true")
+    p.add_argument("--no_denoise", action="store_true")
+    p.add_argument("--severity_mild_max", type=float, default=0.25)
+    p.add_argument("--severity_moderate_max", type=float, default=0.60)
+    p.add_argument("--limit", type=int, default=None, help="Debug: max number of wav files")
+    args = p.parse_args(argv)
+    return PipelineConfig(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        seed=args.seed,
+        n_jobs=args.n_jobs,
+        copd_aug_factor=args.copd_aug_factor,
+        no_augment=args.no_augment,
+        no_denoise=args.no_denoise,
+        severity_mild_max=args.severity_mild_max,
+        severity_moderate_max=args.severity_moderate_max,
+        limit_files=args.limit,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    cfg = parse_args(argv)
+    if not cfg.data_dir.exists():
+        log.error("data_dir does not exist: %s", cfg.data_dir)
+        sys.exit(1)
+    run_pipeline(cfg)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    log.info("COPD-Detection — Preprocessing Pipeline")
-    log.info(f"  Raw dir      : {args.raw_dir}")
-    log.info(f"  Output dir   : {args.out_dir}")
-    log.info(f"  Sample rate  : {args.sample_rate} Hz")
-    log.info(f"  Min duration : {args.min_duration} s")
-    log.info(f"  Denoise      : {not args.no_denoise}")
-    log.info("")
-
-    if not args.raw_dir.exists():
-        log.error(f"raw_dir does not exist: {args.raw_dir}")
-        log.error("Download the ICBHI 2017 dataset and extract it into data/raw/")
-        raise SystemExit(1)
-
-    metadata = process_dataset(
-        raw_dir      = args.raw_dir,
-        out_dir      = args.out_dir,
-        min_duration = args.min_duration,
-        sr           = args.sample_rate,
-        denoise      = not args.no_denoise,
-    )
-
-    log.info("Preprocessing complete.")
+    main()
