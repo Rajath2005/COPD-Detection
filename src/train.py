@@ -180,7 +180,7 @@ def train(args):
     log.info(f"  X_train: {X_train.shape}  X_val: {X_val.shape}")
 
     # ── Determine if baseline CNN uses single channel ─────────────────────
-    single_ch = (args.model == "baseline_cnn")
+    single_ch = False
 
     # ── Binary label conversion (for display) ─────────────────────────────
     if args.num_classes == 2:
