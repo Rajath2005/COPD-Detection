@@ -42,6 +42,7 @@
   - [Dataset Setup](#dataset-setup)
   - [Running the Pipeline](#running-the-pipeline)
 - [Notebooks Guide](#-notebooks-guide)
+- [Objective 1 Completion Report](wiki/Objective-1-Completion-Report.md)
 - [Expected Results](#-expected-results)
 - [Project Timeline](#-project-timeline)
 - [Applications](#-applications)

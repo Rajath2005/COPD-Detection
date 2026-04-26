@@ -16,6 +16,7 @@ Welcome to the official wiki for the **COPD-Detection** project — a deep learn
 | [Dataset](Dataset.md) | ICBHI 2017 Respiratory Sound Database — details and structure |
 | [Installation](Installation.md) | Environment setup, dependencies, and getting started |
 | [Usage](Usage.md) | Step-by-step guide to run the full pipeline |
+| [Objective 1 Completion Report](Objective-1-Completion-Report.md) | Detailed implementation log, results, issues faced, fixes, and final completion status for Objective 1 |
 | [Model Training](Model-Training.md) | Training procedure, hyperparameters, and evaluation |
 | [Results](Results.md) | Expected performance metrics and output interpretation |
 | [Roadmap](Roadmap.md) | Project timeline, milestones, and current status |

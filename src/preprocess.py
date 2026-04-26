@@ -692,51 +692,56 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
     meta_out = pd.DataFrame(expanded_meta)
 
-    # Features
-    X_mel_list: List[np.ndarray] = []
-    X_mfcc_list: List[np.ndarray] = []
-    y_bin_list: List[int] = []
-    y_sev_list: List[int] = []
+    # Features (memory-safe): write directly into disk-backed arrays per split
+    split_names = ("train", "val", "test")
+    split_counts = {
+        name: int((meta_out["split"] == name).sum()) for name in split_names
+    }
+    mmaps: Dict[str, Dict[str, np.ndarray]] = {}
+    labels: Dict[str, Dict[str, np.ndarray]] = {}
+    write_ptr = {name: 0 for name in split_names}
 
-    for y in tqdm(expanded_y, desc="Feature extraction"):
-        X_mel_list.append(extract_log_mel(y, TARGET_SR))
-        X_mfcc_list.append(extract_mfcc_stack(y, TARGET_SR))
-
-    for _, r in meta_out.iterrows():
-        y_bin_list.append(int(r["binary"]))
-        y_sev_list.append(int(r["severity"]))
-
-    X_mel = np.stack(X_mel_list, axis=0).astype(np.float32)
-    X_mfcc = np.stack(X_mfcc_list, axis=0).astype(np.float32)
-    y_binary = np.array(y_bin_list, dtype=np.int64)
-    y_severity = np.array(y_sev_list, dtype=np.int64)
-
-    # Split arrays by meta_out['split']
-    splits = {}
-    for name in ("train", "val", "test"):
-        mask = (meta_out["split"] == name).to_numpy()
-        splits[name] = {
-            "X_mel": X_mel[mask],
-            "X_mfcc": X_mfcc[mask],
-            "y_binary": y_binary[mask],
-            "y_severity": y_severity[mask],
+    for name in split_names:
+        mmaps[name] = {
+            "X_mel": np.lib.format.open_memmap(
+                cfg.output_dir / f"X_mel_{name}.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(split_counts[name], 1, N_MELS, N_FRAMES),
+            ),
+            "X_mfcc": np.lib.format.open_memmap(
+                cfg.output_dir / f"X_mfcc_{name}.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(split_counts[name], 3, N_MFCC, N_FRAMES),
+            ),
+        }
+        labels[name] = {
+            "y_binary": np.empty((split_counts[name],), dtype=np.int64),
+            "y_severity": np.empty((split_counts[name],), dtype=np.int64),
         }
 
-    # Sanity checks
-    for name in ("train", "val", "test"):
-        m = meta_out["split"] == name
-        assert splits[name]["X_mel"].shape[0] == int(m.sum())
+    for i, y in enumerate(tqdm(expanded_y, desc="Feature extraction")):
+        row = meta_out.iloc[i]
+        sp = row["split"]
+        j = write_ptr[sp]
+        mmaps[sp]["X_mel"][j] = extract_log_mel(y, TARGET_SR)
+        mmaps[sp]["X_mfcc"][j] = extract_mfcc_stack(y, TARGET_SR)
+        labels[sp]["y_binary"][j] = int(row["binary"])
+        labels[sp]["y_severity"][j] = int(row["severity"])
+        write_ptr[sp] += 1
+
+    for name in split_names:
+        assert write_ptr[name] == split_counts[name], f"Count mismatch for {name}"
     for a, b in [("train", "val"), ("train", "test"), ("val", "test")]:
         pa = set(meta_out.loc[meta_out["split"] == a, "patient_id"])
         pb = set(meta_out.loc[meta_out["split"] == b, "patient_id"])
         assert pa.isdisjoint(pb), f"Patient leakage between {a} and {b}"
 
-    # Save
-    for name in ("train", "val", "test"):
-        np.save(cfg.output_dir / f"X_mel_{name}.npy", splits[name]["X_mel"])
-        np.save(cfg.output_dir / f"X_mfcc_{name}.npy", splits[name]["X_mfcc"])
-        np.save(cfg.output_dir / f"y_binary_{name}.npy", splits[name]["y_binary"])
-        np.save(cfg.output_dir / f"y_severity_{name}.npy", splits[name]["y_severity"])
+    # Save labels (feature arrays already written via open_memmap)
+    for name in split_names:
+        np.save(cfg.output_dir / f"y_binary_{name}.npy", labels[name]["y_binary"])
+        np.save(cfg.output_dir / f"y_severity_{name}.npy", labels[name]["y_severity"])
 
     meta_path = cfg.output_dir / "metadata.csv"
     meta_out.to_csv(meta_path, index=False)
@@ -775,8 +780,8 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         json.dump(config_dict, f, indent=2)
 
     log.info("Saved features to %s", cfg.output_dir)
-    log.info("X_mel train shape: %s", splits["train"]["X_mel"].shape)
-    log.info("X_mfcc train shape: %s", splits["train"]["X_mfcc"].shape)
+    log.info("X_mel train shape: %s", mmaps["train"]["X_mel"].shape)
+    log.info("X_mfcc train shape: %s", mmaps["train"]["X_mfcc"].shape)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
