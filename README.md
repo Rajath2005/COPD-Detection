@@ -23,6 +23,7 @@
 ## 📋 Table of Contents
 
 - [Overview](#-overview)
+- [📚 Documentation Hub](#-documentation-hub) **← Start here for code explanations!**
 - [Motivation & Problem Statement](#-motivation--problem-statement)
 - [Team](#-team)
 - [Objectives](#-objectives)
@@ -66,7 +67,24 @@ The system leverages the **ICBHI 2017 Respiratory Sound Database** and a hybrid 
 
 ---
 
-## 💡 Motivation & Problem Statement
+## � Documentation Hub
+
+**All code explanations, technical breakdowns, and detailed guides are organized in the [`docs/explanations/`](docs/explanations/) folder.**
+
+### 🎯 Quick Access to Explanations
+
+| Component | PDF Explanation | Location |
+|-----------|---|---|
+| **Audio Signal Processing** | ICBHI Signal Pipeline | [`docs/explanations/data-pipeline/`](docs/explanations/data-pipeline/) |
+| **Acoustic Feature Engineering** | Blueprints for Respiratory Health & VCET Feature Architecture | [`docs/explanations/feature-extraction/`](docs/explanations/feature-extraction/) |
+| **Deep Learning Model Architecture** | Deep Learning for Respiratory Classification | [`docs/explanations/model-training/`](docs/explanations/model-training/) |
+| **COPD Severity Classification** | Acoustic COPD Severity Grading | [`docs/explanations/classification/`](docs/explanations/classification/) |
+
+👉 **[Browse all explanations →](docs/explanations/README.md)**
+
+---
+
+## �💡 Motivation & Problem Statement
 
 ### Why COPD?
 - COPD is **irreversible but manageable** — early intervention significantly slows progression and improves quality of life.

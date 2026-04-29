@@ -26,6 +26,10 @@ __pycache__/
 # NumPy arrays
 *.npy
 
+# Large PDF files (explanation documents - stored locally, not in git)
+docs/explanations/**/*.pdf
+Notebook-PDF/**/*.pdf
+
 # VS Code
 .vscode/
 
